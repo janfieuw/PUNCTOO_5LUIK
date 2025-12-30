@@ -462,6 +462,149 @@ app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+// -------------------- MyPunctoo: Employees CRUD --------------------
+
+// kleine helper: hergebruik dezelfde toegangssleutel als /access
+async function requireMypunctooAccess(email) {
+  const cQ = `
+    SELECT client_id, mypunctoo_enabled
+    FROM client
+    WHERE client_type = 'CUSTOMER' AND email = $1
+    LIMIT 1
+  `;
+  const cR = await pool.query(cQ, [email]);
+  if (cR.rowCount === 0) {
+    return { ok: true, allowed: false, reason: "NO_CUSTOMER_ACCOUNT" };
+  }
+  const client = cR.rows[0];
+  if (!client.mypunctoo_enabled) {
+    return { ok: true, allowed: false, reason: "NOT_ENABLED_YET", client_id: client.client_id };
+  }
+
+  // (optioneel streng) vereis ACTIVE scantag
+  const sQ = `
+    SELECT scantag_id
+    FROM scantag
+    WHERE client_id = $1 AND status = 'ACTIVE'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+  const sR = await pool.query(sQ, [client.client_id]);
+  if (sR.rowCount === 0) {
+    return { ok: true, allowed: false, reason: "NO_ACTIVE_SCANTAG", client_id: client.client_id };
+  }
+
+  return { ok: true, allowed: true, client_id: client.client_id };
+}
+
+// LIST employees
+app.get("/api/mypunctoo/employees", async (req, res) => {
+  const email = (req.query.email || "").toString().trim().toLowerCase();
+  if (!email) return res.status(400).json({ ok: false, error: "email query param is required" });
+
+  try {
+    const access = await requireMypunctooAccess(email);
+    if (!access.allowed) return res.json(access);
+
+    const q = `
+      SELECT employee_id, first_name, last_name, email, created_at
+      FROM employee
+      WHERE client_id = $1
+      ORDER BY created_at DESC
+    `;
+    const r = await pool.query(q, [access.client_id]);
+    return res.json({ ok: true, employees: r.rows });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// CREATE employee
+app.post("/api/mypunctoo/employees", async (req, res) => {
+  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
+  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
+
+  const first_name = (req.body.first_name || "").toString().trim();
+  const last_name  = (req.body.last_name || "").toString().trim();
+  const empEmail   = (req.body.email || "").toString().trim().toLowerCase();
+
+  if (!first_name || !last_name || !empEmail) {
+    return res.status(400).json({ ok: false, error: "first_name, last_name, email are required" });
+  }
+
+  try {
+    const access = await requireMypunctooAccess(ownerEmail);
+    if (!access.allowed) return res.json(access);
+
+    const q = `
+      INSERT INTO employee (client_id, first_name, last_name, email)
+      VALUES ($1, $2, $3, $4)
+      RETURNING employee_id, first_name, last_name, email, created_at
+    `;
+    const r = await pool.query(q, [access.client_id, first_name, last_name, empEmail]);
+    return res.status(201).json({ ok: true, employee: r.rows[0] });
+  } catch (err) {
+    // typische fout: duplicate (unique constraint)
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// UPDATE employee
+app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
+  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
+  const employee_id = req.params.employee_id;
+
+  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
+
+  const first_name = (req.body.first_name || "").toString().trim();
+  const last_name  = (req.body.last_name || "").toString().trim();
+  const empEmail   = (req.body.email || "").toString().trim().toLowerCase();
+
+  try {
+    const access = await requireMypunctooAccess(ownerEmail);
+    if (!access.allowed) return res.json(access);
+
+    const q = `
+      UPDATE employee
+      SET first_name = COALESCE(NULLIF($1,''), first_name),
+          last_name  = COALESCE(NULLIF($2,''), last_name),
+          email      = COALESCE(NULLIF($3,''), email)
+      WHERE employee_id = $4 AND client_id = $5
+      RETURNING employee_id, first_name, last_name, email, created_at
+    `;
+    const r = await pool.query(q, [first_name, last_name, empEmail, employee_id, access.client_id]);
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
+
+    return res.json({ ok: true, employee: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// DELETE employee
+app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
+  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
+  const employee_id = req.params.employee_id;
+
+  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
+
+  try {
+    const access = await requireMypunctooAccess(ownerEmail);
+    if (!access.allowed) return res.json(access);
+
+    const q = `
+      DELETE FROM employee
+      WHERE employee_id = $1 AND client_id = $2
+      RETURNING employee_id
+    `;
+    const r = await pool.query(q, [employee_id, access.client_id]);
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
+
+    return res.json({ ok: true, deleted: true, employee_id: r.rows[0].employee_id });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // -------------------- listen (ALTIJD op het einde) --------------------
 const port = process.env.PORT || 3000;
