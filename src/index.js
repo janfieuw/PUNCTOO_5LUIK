@@ -533,6 +533,7 @@ app.post("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) =
     const own = await requireEmployeeBelongsToClient(employee_id, ctx.client.client_id);
     if (!own.ok) return res.status(own.status).json(own.body);
 
+    // ✅ FIX: scantag_id is NOT NULL in DB → we must insert ctx.scantag.scantag_id
     const q = `
       INSERT INTO public.scan_event (
         scan_event_id,
@@ -549,18 +550,19 @@ app.post("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) =
       VALUES (
         gen_random_uuid(),
         $1,
-        NULL,
         $2,
-        $3::public.scan_direction,
+        $3,
+        $4::public.scan_direction,
         NOW(),
         'mypunctoo',
-        $4,
-        $5::inet,
+        $5,
+        $6::inet,
         NOW()
       )
       RETURNING
         scan_event_id,
         client_id,
+        scantag_id,
         employee_id,
         direction,
         scanned_at,
@@ -571,10 +573,17 @@ app.post("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) =
     const userAgent = req.headers["user-agent"] || null;
     const ip = normalizeIp(req) || null;
 
-    const r = await pool.query(q, [ctx.client.client_id, employee_id, direction, userAgent, ip]);
+    const r = await pool.query(q, [
+      ctx.client.client_id,
+      ctx.scantag.scantag_id, // ✅ FIX
+      employee_id,
+      direction,
+      userAgent,
+      ip,
+    ]);
+
     return res.status(201).json({ ok: true, event: r.rows[0] });
   } catch (err) {
-    // bv. inet cast kan falen als ip leeg is of ongeldige string
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
