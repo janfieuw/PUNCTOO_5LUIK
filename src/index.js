@@ -274,3 +274,76 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
     cx.release();
   }
 });
+// --- MyPunctoo access gate ---
+// Input: email (later vervangen door echte login/session)
+// Output: allowed + reason + client_id + scantag_id (indien beschikbaar)
+app.get("/api/mypunctoo/access", async (req, res) => {
+  const email = (req.query.email || "").toString().trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ ok: false, error: "email query param is required" });
+  }
+
+  try {
+    // CUSTOMER client by email
+    const cQ = `
+      SELECT client_id, client_type, company_name, email, mypunctoo_enabled, mypunctoo_enabled_at
+      FROM client
+      WHERE client_type = 'CUSTOMER' AND email = $1
+      LIMIT 1
+    `;
+    const cR = await pool.query(cQ, [email]);
+
+    if (cR.rowCount === 0) {
+      return res.status(404).json({
+        ok: true,
+        allowed: false,
+        reason: "NO_CUSTOMER_ACCOUNT",
+      });
+    }
+
+    const client = cR.rows[0];
+
+    if (!client.mypunctoo_enabled) {
+      return res.json({
+        ok: true,
+        allowed: false,
+        reason: "NOT_ENABLED_YET",
+        client_id: client.client_id,
+      });
+    }
+
+    // Must have an ACTIVE scantag
+    const sQ = `
+      SELECT scantag_id, qr_url_in, qr_url_out, status, created_at
+      FROM scantag
+      WHERE client_id = $1 AND status = 'ACTIVE'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const sR = await pool.query(sQ, [client.client_id]);
+
+    if (sR.rowCount === 0) {
+      return res.json({
+        ok: true,
+        allowed: false,
+        reason: "NO_ACTIVE_SCANTAG",
+        client_id: client.client_id,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      allowed: true,
+      reason: "OK",
+      client: {
+        client_id: client.client_id,
+        company_name: client.company_name,
+        email: client.email,
+        mypunctoo_enabled_at: client.mypunctoo_enabled_at,
+      },
+      scantag: sR.rows[0],
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
