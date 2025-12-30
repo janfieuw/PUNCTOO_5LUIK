@@ -2,6 +2,9 @@ const express = require("express");
 const { pool } = require("./db");
 const crypto = require("crypto");
 
+// ✅ NEW: scan-events router (refactor optie 1)
+const mypunctooScanEventsRoutes = require("./routes/mypunctooScanEvents.routes");
+
 const app = express();
 app.use(express.json());
 
@@ -513,119 +516,11 @@ app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
 });
 
 // ===============================================================
-// Scan Events (MyPunctoo)
+// Scan Events (MyPunctoo) - MOVED TO ROUTES FILE
 // ===============================================================
 
-// POST scan event (IN/OUT)
-app.post("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) => {
-  try {
-    const ctx = await getMypunctooContext(req.query.email);
-    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
-
-    const { employee_id } = req.params;
-    const { direction } = req.body || {};
-
-    if (!direction) return res.status(400).json({ ok: false, error: "direction is required" });
-    if (direction !== "IN" && direction !== "OUT") {
-      return res.status(400).json({ ok: false, error: "direction must be IN or OUT" });
-    }
-
-    const own = await requireEmployeeBelongsToClient(employee_id, ctx.client.client_id);
-    if (!own.ok) return res.status(own.status).json(own.body);
-
-    // ✅ FIX: scantag_id is NOT NULL in DB → we must insert ctx.scantag.scantag_id
-    const q = `
-      INSERT INTO public.scan_event (
-        scan_event_id,
-        client_id,
-        scantag_id,
-        employee_id,
-        direction,
-        scanned_at,
-        source,
-        user_agent,
-        ip_address,
-        created_at
-      )
-      VALUES (
-        gen_random_uuid(),
-        $1,
-        $2,
-        $3,
-        $4::public.scan_direction,
-        NOW(),
-        'mypunctoo',
-        $5,
-        $6::inet,
-        NOW()
-      )
-      RETURNING
-        scan_event_id,
-        client_id,
-        scantag_id,
-        employee_id,
-        direction,
-        scanned_at,
-        source,
-        created_at;
-    `;
-
-    const userAgent = req.headers["user-agent"] || null;
-    const ip = normalizeIp(req) || null;
-
-    const r = await pool.query(q, [
-      ctx.client.client_id,
-      ctx.scantag.scantag_id, // ✅ FIX
-      employee_id,
-      direction,
-      userAgent,
-      ip,
-    ]);
-
-    return res.status(201).json({ ok: true, event: r.rows[0] });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// GET scan events history
-app.get("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) => {
-  try {
-    const ctx = await getMypunctooContext(req.query.email);
-    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
-
-    const { employee_id } = req.params;
-
-    const limitRaw = (req.query.limit || "50").toString();
-    let limit = parseInt(limitRaw, 10);
-    if (Number.isNaN(limit) || limit < 1) limit = 50;
-    if (limit > 200) limit = 200;
-
-    const own = await requireEmployeeBelongsToClient(employee_id, ctx.client.client_id);
-    if (!own.ok) return res.status(own.status).json(own.body);
-
-    const q = `
-      SELECT
-        scan_event_id,
-        direction,
-        scanned_at,
-        source,
-        created_at
-      FROM public.scan_event
-      WHERE client_id = $1 AND employee_id = $2
-      ORDER BY scanned_at DESC, created_at DESC
-      LIMIT $3
-    `;
-    const r = await pool.query(q, [ctx.client.client_id, employee_id, limit]);
-
-    const events = r.rows;
-    const current_status = events.length ? events[0].direction : null;
-
-    return res.json({ ok: true, employee_id, current_status, events });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
+// ✅ NEW: mount scan-events router (this router defines /employees/:id/scan-events)
+app.use("/api/mypunctoo", mypunctooScanEventsRoutes);
 
 // -------------------- listen (ALTIJD op het einde) --------------------
 const port = process.env.PORT || 3000;
