@@ -5,15 +5,32 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
+// Als Railway/Proxy: uncomment indien je correcte req.ip wil
+// app.set("trust proxy", 1);
+
 // -------------------- helpers --------------------
 function isEmail(s) {
   return typeof s === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 }
 
+function normalizeIp(req) {
+  const raw = req.ip || "";
+  return raw.startsWith("::ffff:") ? raw.replace("::ffff:", "") : raw;
+}
+
+/**
+ * Basis: klant vinden op email, enkel CUSTOMER.
+ * Let op: deze functie checkt enkel CUSTOMER + mypunctoo_enabled.
+ * Active scantag check zit in getMypunctooContext().
+ */
 async function getEnabledCustomerByEmail(emailRaw) {
   const email = (emailRaw || "").toString().trim().toLowerCase();
   if (!email) {
-    return { ok: false, status: 400, body: { ok: false, error: "email query param is required" } };
+    return {
+      ok: false,
+      status: 400,
+      body: { ok: false, error: "email query param is required" },
+    };
   }
 
   const cQ = `
@@ -33,6 +50,7 @@ async function getEnabledCustomerByEmail(emailRaw) {
   }
 
   const client = cR.rows[0];
+
   if (!client.mypunctoo_enabled) {
     return {
       ok: false,
@@ -44,12 +62,69 @@ async function getEnabledCustomerByEmail(emailRaw) {
   return { ok: true, client };
 }
 
+/**
+ * MyPunctoo context = enabled customer + minstens 1 ACTIVE scantag
+ * Dit gebruiken we voor employees én scan-events.
+ */
+async function getMypunctooContext(emailRaw) {
+  const g = await getEnabledCustomerByEmail(emailRaw);
+  if (!g.ok) return g;
+
+  const client = g.client;
+
+  const sQ = `
+    SELECT scantag_id, qr_url_in, qr_url_out, status, created_at
+    FROM scantag
+    WHERE client_id = $1 AND status = 'ACTIVE'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+  const sR = await pool.query(sQ, [client.client_id]);
+
+  if (sR.rowCount === 0) {
+    return {
+      ok: false,
+      status: 200,
+      body: { ok: true, allowed: false, reason: "NO_ACTIVE_SCANTAG", client_id: client.client_id },
+    };
+  }
+
+  return { ok: true, client, scantag: sR.rows[0] };
+}
+
+async function requireEmployeeBelongsToClient(employee_id, client_id) {
+  const q = `
+    SELECT employee_id
+    FROM employee
+    WHERE employee_id = $1 AND client_id = $2
+    LIMIT 1
+  `;
+  const r = await pool.query(q, [employee_id, client_id]);
+  if (r.rowCount === 0) {
+    return { ok: false, status: 404, body: { ok: false, error: "employee not found" } };
+  }
+  return { ok: true };
+}
+
 // -------------------- health --------------------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "PUNCTOO_5LUIK" });
 });
 
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, service: "PUNCTOO_5LUIK" });
+});
+
 app.get("/db-check", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT NOW() as now");
+    res.json({ ok: true, db: "connected", now: r.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ ok: false, db: "error", message: err.message });
+  }
+});
+
+app.get("/api/db-check", async (req, res) => {
   try {
     const r = await pool.query("SELECT NOW() as now");
     res.json({ ok: true, db: "connected", now: r.rows[0].now });
@@ -264,34 +339,20 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
 // -------------------- MyPunctoo access gate --------------------
 app.get("/api/mypunctoo/access", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
-
-    const client = g.client;
-
-    const sQ = `
-      SELECT scantag_id, qr_url_in, qr_url_out, status, created_at
-      FROM scantag
-      WHERE client_id = $1 AND status = 'ACTIVE'
-      ORDER BY created_at DESC
-      LIMIT 1
-    `;
-    const sR = await pool.query(sQ, [client.client_id]);
-    if (sR.rowCount === 0) {
-      return res.json({ ok: true, allowed: false, reason: "NO_ACTIVE_SCANTAG", client_id: client.client_id });
-    }
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
     return res.json({
       ok: true,
       allowed: true,
       reason: "OK",
       client: {
-        client_id: client.client_id,
-        company_name: client.company_name,
-        email: client.email,
-        mypunctoo_enabled_at: client.mypunctoo_enabled_at,
+        client_id: ctx.client.client_id,
+        company_name: ctx.client.company_name,
+        email: ctx.client.email,
+        mypunctoo_enabled_at: ctx.client.mypunctoo_enabled_at,
       },
-      scantag: sR.rows[0],
+      scantag: ctx.scantag,
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
@@ -299,16 +360,14 @@ app.get("/api/mypunctoo/access", async (req, res) => {
 });
 
 // ===============================================================
-// Employees CRUD (MyPunctoo)
+// Employees CRUD (MyPunctoo) - SINGLE SOURCE OF TRUTH
 // ===============================================================
 
 // LIST employees
 app.get("/api/mypunctoo/employees", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
-
-    const clientId = g.client.client_id;
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
     const q = `
       SELECT employee_id, client_id, first_name, last_name, email, created_at, updated_at
@@ -316,7 +375,7 @@ app.get("/api/mypunctoo/employees", async (req, res) => {
       WHERE client_id = $1
       ORDER BY created_at DESC
     `;
-    const r = await pool.query(q, [clientId]);
+    const r = await pool.query(q, [ctx.client.client_id]);
     return res.json({ ok: true, employees: r.rows });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
@@ -326,10 +385,8 @@ app.get("/api/mypunctoo/employees", async (req, res) => {
 // CREATE employee
 app.post("/api/mypunctoo/employees", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
-
-    const clientId = g.client.client_id;
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
     const { first_name, last_name, email } = req.body || {};
     if (!first_name || typeof first_name !== "string") {
@@ -348,7 +405,7 @@ app.post("/api/mypunctoo/employees", async (req, res) => {
       RETURNING employee_id, client_id, first_name, last_name, email, created_at, updated_at
     `;
     const r = await pool.query(q, [
-      clientId,
+      ctx.client.client_id,
       first_name.trim(),
       last_name.trim(),
       email.trim().toLowerCase(),
@@ -356,7 +413,6 @@ app.post("/api/mypunctoo/employees", async (req, res) => {
 
     return res.status(201).json({ ok: true, employee: r.rows[0] });
   } catch (err) {
-    // typische oorzaak: unieke constraint (bv. client_id+email)
     if ((err.code || "").toString() === "23505") {
       return res.status(409).json({ ok: false, error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" });
     }
@@ -367,10 +423,9 @@ app.post("/api/mypunctoo/employees", async (req, res) => {
 // READ employee by id
 app.get("/api/mypunctoo/employees/:employee_id", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
-    const clientId = g.client.client_id;
     const { employee_id } = req.params;
 
     const q = `
@@ -379,7 +434,7 @@ app.get("/api/mypunctoo/employees/:employee_id", async (req, res) => {
       WHERE employee_id = $1 AND client_id = $2
       LIMIT 1
     `;
-    const r = await pool.query(q, [employee_id, clientId]);
+    const r = await pool.query(q, [employee_id, ctx.client.client_id]);
     if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
 
     return res.json({ ok: true, employee: r.rows[0] });
@@ -391,15 +446,12 @@ app.get("/api/mypunctoo/employees/:employee_id", async (req, res) => {
 // UPDATE employee
 app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
-    const clientId = g.client.client_id;
     const { employee_id } = req.params;
-
     const { first_name, last_name, email } = req.body || {};
 
-    // minstens 1 veld
     if (!first_name && !last_name && !email) {
       return res.status(400).json({ ok: false, error: "provide first_name and/or last_name and/or email" });
     }
@@ -419,7 +471,7 @@ app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
     `;
     const r = await pool.query(q, [
       employee_id,
-      clientId,
+      ctx.client.client_id,
       first_name ? first_name.trim() : null,
       last_name ? last_name.trim() : null,
       email ? email.trim().toLowerCase() : null,
@@ -438,169 +490,129 @@ app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
 // DELETE employee
 app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
   try {
-    const g = await getEnabledCustomerByEmail(req.query.email);
-    if (!g.ok) return res.status(g.status).json(g.body);
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
 
-    const clientId = g.client.client_id;
     const { employee_id } = req.params;
 
-    // hard delete (als scan_event FK restrict is, kan dit falen — dan tonen we een duidelijke fout)
     const q = `
       DELETE FROM employee
       WHERE employee_id = $1 AND client_id = $2
       RETURNING employee_id
     `;
-    const r = await pool.query(q, [employee_id, clientId]);
+    const r = await pool.query(q, [employee_id, ctx.client.client_id]);
     if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
 
     return res.json({ ok: true, deleted: true, employee_id: r.rows[0].employee_id });
   } catch (err) {
-    // foreign key violation (bv. scan_event verwijst nog)
     if ((err.code || "").toString() === "23503") {
       return res.status(409).json({ ok: false, error: "EMPLOYEE_IN_USE_CANNOT_DELETE" });
     }
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
-// -------------------- MyPunctoo: Employees CRUD --------------------
 
-// kleine helper: hergebruik dezelfde toegangssleutel als /access
-async function requireMypunctooAccess(email) {
-  const cQ = `
-    SELECT client_id, mypunctoo_enabled
-    FROM client
-    WHERE client_type = 'CUSTOMER' AND email = $1
-    LIMIT 1
-  `;
-  const cR = await pool.query(cQ, [email]);
-  if (cR.rowCount === 0) {
-    return { ok: true, allowed: false, reason: "NO_CUSTOMER_ACCOUNT" };
-  }
-  const client = cR.rows[0];
-  if (!client.mypunctoo_enabled) {
-    return { ok: true, allowed: false, reason: "NOT_ENABLED_YET", client_id: client.client_id };
-  }
+// ===============================================================
+// Scan Events (MyPunctoo)
+// ===============================================================
 
-  // (optioneel streng) vereis ACTIVE scantag
-  const sQ = `
-    SELECT scantag_id
-    FROM scantag
-    WHERE client_id = $1 AND status = 'ACTIVE'
-    ORDER BY created_at DESC
-    LIMIT 1
-  `;
-  const sR = await pool.query(sQ, [client.client_id]);
-  if (sR.rowCount === 0) {
-    return { ok: true, allowed: false, reason: "NO_ACTIVE_SCANTAG", client_id: client.client_id };
-  }
-
-  return { ok: true, allowed: true, client_id: client.client_id };
-}
-
-// LIST employees
-app.get("/api/mypunctoo/employees", async (req, res) => {
-  const email = (req.query.email || "").toString().trim().toLowerCase();
-  if (!email) return res.status(400).json({ ok: false, error: "email query param is required" });
-
+// POST scan event (IN/OUT)
+app.post("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) => {
   try {
-    const access = await requireMypunctooAccess(email);
-    if (!access.allowed) return res.json(access);
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
+
+    const { employee_id } = req.params;
+    const { direction } = req.body || {};
+
+    if (!direction) return res.status(400).json({ ok: false, error: "direction is required" });
+    if (direction !== "IN" && direction !== "OUT") {
+      return res.status(400).json({ ok: false, error: "direction must be IN or OUT" });
+    }
+
+    const own = await requireEmployeeBelongsToClient(employee_id, ctx.client.client_id);
+    if (!own.ok) return res.status(own.status).json(own.body);
 
     const q = `
-      SELECT employee_id, first_name, last_name, email, created_at
-      FROM employee
-      WHERE client_id = $1
-      ORDER BY created_at DESC
+      INSERT INTO public.scan_event (
+        scan_event_id,
+        client_id,
+        scantag_id,
+        employee_id,
+        direction,
+        scanned_at,
+        source,
+        user_agent,
+        ip_address,
+        created_at
+      )
+      VALUES (
+        gen_random_uuid(),
+        $1,
+        NULL,
+        $2,
+        $3::public.scan_direction,
+        NOW(),
+        'mypunctoo',
+        $4,
+        $5::inet,
+        NOW()
+      )
+      RETURNING
+        scan_event_id,
+        client_id,
+        employee_id,
+        direction,
+        scanned_at,
+        source,
+        created_at;
     `;
-    const r = await pool.query(q, [access.client_id]);
-    return res.json({ ok: true, employees: r.rows });
+
+    const userAgent = req.headers["user-agent"] || null;
+    const ip = normalizeIp(req) || null;
+
+    const r = await pool.query(q, [ctx.client.client_id, employee_id, direction, userAgent, ip]);
+    return res.status(201).json({ ok: true, event: r.rows[0] });
   } catch (err) {
+    // bv. inet cast kan falen als ip leeg is of ongeldige string
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// CREATE employee
-app.post("/api/mypunctoo/employees", async (req, res) => {
-  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
-  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
-
-  const first_name = (req.body.first_name || "").toString().trim();
-  const last_name  = (req.body.last_name || "").toString().trim();
-  const empEmail   = (req.body.email || "").toString().trim().toLowerCase();
-
-  if (!first_name || !last_name || !empEmail) {
-    return res.status(400).json({ ok: false, error: "first_name, last_name, email are required" });
-  }
-
+// GET scan events history
+app.get("/api/mypunctoo/employees/:employee_id/scan-events", async (req, res) => {
   try {
-    const access = await requireMypunctooAccess(ownerEmail);
-    if (!access.allowed) return res.json(access);
+    const ctx = await getMypunctooContext(req.query.email);
+    if (!ctx.ok) return res.status(ctx.status).json(ctx.body);
+
+    const { employee_id } = req.params;
+
+    const limitRaw = (req.query.limit || "50").toString();
+    let limit = parseInt(limitRaw, 10);
+    if (Number.isNaN(limit) || limit < 1) limit = 50;
+    if (limit > 200) limit = 200;
+
+    const own = await requireEmployeeBelongsToClient(employee_id, ctx.client.client_id);
+    if (!own.ok) return res.status(own.status).json(own.body);
 
     const q = `
-      INSERT INTO employee (client_id, first_name, last_name, email)
-      VALUES ($1, $2, $3, $4)
-      RETURNING employee_id, first_name, last_name, email, created_at
+      SELECT
+        scan_event_id,
+        direction,
+        scanned_at,
+        source,
+        created_at
+      FROM public.scan_event
+      WHERE client_id = $1 AND employee_id = $2
+      ORDER BY scanned_at DESC, created_at DESC
+      LIMIT $3
     `;
-    const r = await pool.query(q, [access.client_id, first_name, last_name, empEmail]);
-    return res.status(201).json({ ok: true, employee: r.rows[0] });
-  } catch (err) {
-    // typische fout: duplicate (unique constraint)
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
+    const r = await pool.query(q, [ctx.client.client_id, employee_id, limit]);
 
-// UPDATE employee
-app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
-  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
-  const employee_id = req.params.employee_id;
+    const events = r.rows;
+    const current_status = events.length ? events[0].direction : null;
 
-  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
-
-  const first_name = (req.body.first_name || "").toString().trim();
-  const last_name  = (req.body.last_name || "").toString().trim();
-  const empEmail   = (req.body.email || "").toString().trim().toLowerCase();
-
-  try {
-    const access = await requireMypunctooAccess(ownerEmail);
-    if (!access.allowed) return res.json(access);
-
-    const q = `
-      UPDATE employee
-      SET first_name = COALESCE(NULLIF($1,''), first_name),
-          last_name  = COALESCE(NULLIF($2,''), last_name),
-          email      = COALESCE(NULLIF($3,''), email)
-      WHERE employee_id = $4 AND client_id = $5
-      RETURNING employee_id, first_name, last_name, email, created_at
-    `;
-    const r = await pool.query(q, [first_name, last_name, empEmail, employee_id, access.client_id]);
-    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
-
-    return res.json({ ok: true, employee: r.rows[0] });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// DELETE employee
-app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
-  const ownerEmail = (req.query.email || "").toString().trim().toLowerCase();
-  const employee_id = req.params.employee_id;
-
-  if (!ownerEmail) return res.status(400).json({ ok: false, error: "email query param is required" });
-
-  try {
-    const access = await requireMypunctooAccess(ownerEmail);
-    if (!access.allowed) return res.json(access);
-
-    const q = `
-      DELETE FROM employee
-      WHERE employee_id = $1 AND client_id = $2
-      RETURNING employee_id
-    `;
-    const r = await pool.query(q, [employee_id, access.client_id]);
-    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
-
-    return res.json({ ok: true, deleted: true, employee_id: r.rows[0].employee_id });
+    return res.json({ ok: true, employee_id, current_status, events });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
