@@ -2,39 +2,63 @@ const express = require("express");
 const { pool } = require("./db");
 const crypto = require("crypto");
 
-
 const app = express();
 app.use(express.json());
 
-// health
+// -------------------- helpers --------------------
+function isEmail(s) {
+  return typeof s === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+async function getEnabledCustomerByEmail(emailRaw) {
+  const email = (emailRaw || "").toString().trim().toLowerCase();
+  if (!email) {
+    return { ok: false, status: 400, body: { ok: false, error: "email query param is required" } };
+  }
+
+  const cQ = `
+    SELECT client_id, client_type, company_name, email, mypunctoo_enabled, mypunctoo_enabled_at
+    FROM client
+    WHERE client_type = 'CUSTOMER' AND email = $1
+    LIMIT 1
+  `;
+  const cR = await pool.query(cQ, [email]);
+
+  if (cR.rowCount === 0) {
+    return {
+      ok: false,
+      status: 404,
+      body: { ok: true, allowed: false, reason: "NO_CUSTOMER_ACCOUNT" },
+    };
+  }
+
+  const client = cR.rows[0];
+  if (!client.mypunctoo_enabled) {
+    return {
+      ok: false,
+      status: 200,
+      body: { ok: true, allowed: false, reason: "NOT_ENABLED_YET", client_id: client.client_id },
+    };
+  }
+
+  return { ok: true, client };
+}
+
+// -------------------- health --------------------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "PUNCTOO_5LUIK" });
 });
 
-// DB check
 app.get("/db-check", async (req, res) => {
   try {
     const r = await pool.query("SELECT NOW() as now");
     res.json({ ok: true, db: "connected", now: r.rows[0].now });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      db: "error",
-      message: err.message,
-    });
+    res.status(500).json({ ok: false, db: "error", message: err.message });
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
-// --- helpers ---
-function isEmail(s) {
-  return typeof s === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
-}
-
-// --- create customer order (signup as order) ---
+// -------------------- orders (customer signup as order) --------------------
 app.post("/api/orders", async (req, res) => {
   const {
     company_name,
@@ -49,7 +73,6 @@ app.post("/api/orders", async (req, res) => {
     city,
   } = req.body || {};
 
-  // minimal validation
   if (!company_name || typeof company_name !== "string") {
     return res.status(400).json({ ok: false, error: "company_name is required" });
   }
@@ -59,18 +82,14 @@ app.post("/api/orders", async (req, res) => {
   if (!isEmail(email)) {
     return res.status(400).json({ ok: false, error: "valid email is required" });
   }
-
-  // CUSTOMER must have vat_number (your rule: DEMO has none; CUSTOMER does)
   if (!vat_number || typeof vat_number !== "string") {
     return res.status(400).json({ ok: false, error: "vat_number is required for CUSTOMER" });
   }
 
-  const client = await pool.connect();
+  const cx = await pool.connect();
   try {
-    await client.query("BEGIN");
+    await cx.query("BEGIN");
 
-    // Upsert CUSTOMER client by (client_type,email) to prevent duplicates on retry
-    // If same customer re-orders, we keep client record and just create a new order.
     const upsertClientSql = `
       INSERT INTO client (
         client_type, company_name, vat_number,
@@ -98,7 +117,7 @@ app.post("/api/orders", async (req, res) => {
       RETURNING client_id, mypunctoo_enabled;
     `;
 
-    const clientRow = await client.query(upsertClientSql, [
+    const clientRow = await cx.query(upsertClientSql, [
       company_name.trim(),
       vat_number.trim(),
       contact_name.trim(),
@@ -113,16 +132,14 @@ app.post("/api/orders", async (req, res) => {
 
     const clientId = clientRow.rows[0].client_id;
 
-    // Create NEW order (includes 1 ScanTag later when processed by admin)
     const orderSql = `
       INSERT INTO subscription_order (client_id, status, admin_note)
       VALUES ($1, 'NEW', 'Customer signup (includes 1 ScanTag)')
       RETURNING order_id, status, created_at;
     `;
-    const orderRow = await client.query(orderSql, [clientId]);
+    const orderRow = await cx.query(orderSql, [clientId]);
 
-    await client.query("COMMIT");
-
+    await cx.query("COMMIT");
     return res.status(201).json({
       ok: true,
       client_id: clientId,
@@ -130,17 +147,15 @@ app.post("/api/orders", async (req, res) => {
       message: "Order created. Awaiting admin processing to enable MyPunctoo and assign ScanTag.",
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await cx.query("ROLLBACK");
     return res.status(500).json({ ok: false, error: err.message });
   } finally {
-    client.release();
+    cx.release();
   }
 });
 
-// --- order status ---
 app.get("/api/orders/:order_id", async (req, res) => {
   const { order_id } = req.params;
-
   try {
     const q = `
       SELECT
@@ -161,26 +176,22 @@ app.get("/api/orders/:order_id", async (req, res) => {
       LIMIT 1;
     `;
     const r = await pool.query(q, [order_id]);
-
-    if (r.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "order not found" });
-    }
-
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "order not found" });
     return res.json({ ok: true, order: r.rows[0] });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
-// --- ADMIN: process an order (assign 1 ScanTag, enable MyPunctoo, mark ready to invoice) ---
-// TODO: protect this route with ADMIN_LOGIN / ADMIN_PASSWORD_HASH (shared admin login)
+
+// -------------------- admin: process order --------------------
+// TODO later: protect with ADMIN_LOGIN / ADMIN_PASSWORD_HASH from env/config
 app.post("/api/admin/orders/:order_id/process", async (req, res) => {
   const { order_id } = req.params;
-
   const cx = await pool.connect();
+
   try {
     await cx.query("BEGIN");
 
-    // Lock the order row to avoid double processing
     const orderQ = `
       SELECT o.order_id, o.status, o.client_id
       FROM subscription_order o
@@ -188,52 +199,30 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
       FOR UPDATE
     `;
     const orderR = await cx.query(orderQ, [order_id]);
-
     if (orderR.rowCount === 0) {
       await cx.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "order not found" });
     }
 
     const order = orderR.rows[0];
-
     if (order.status !== "NEW") {
-      // already processed or not in correct state
       await cx.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: `order not processable (status=${order.status})`,
-      });
+      return res.status(409).json({ ok: false, error: `order not processable (status=${order.status})` });
     }
 
     const clientId = order.client_id;
 
-    // Create ScanTag for this client (includes IN + OUT QR urls + printable id)
-    // We'll generate simple unique urls for now; later we can align exact URL format.
-    // Important: ScanTag-ID = composed print asset (PDF) built from qr_url_in + qr_url_out.
-    // For now: store urls; PDF generation comes later.
     const insertScanTagQ = `
-      INSERT INTO scantag (
-        client_id,
-        qr_url_in,
-        qr_url_out,
-        status
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        'ACTIVE'
-      )
+      INSERT INTO scantag (client_id, qr_url_in, qr_url_out, status)
+      VALUES ($1, $2, $3, 'ACTIVE')
       RETURNING scantag_id, qr_url_in, qr_url_out, status, created_at;
     `;
 
     const qrIn = `https://scan.punctoo.be/in/${crypto.randomUUID()}`;
     const qrOut = `https://scan.punctoo.be/out/${crypto.randomUUID()}`;
-
     const stR = await cx.query(insertScanTagQ, [clientId, qrIn, qrOut]);
     const scantag = stR.rows[0];
 
-    // Enable MyPunctoo for the client
     const enableClientQ = `
       UPDATE client
       SET mypunctoo_enabled = TRUE,
@@ -244,7 +233,6 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
     `;
     const clientR = await cx.query(enableClientQ, [clientId]);
 
-    // Mark order processed + ready to invoice
     const updOrderQ = `
       UPDATE subscription_order
       SET status = 'PROCESSED',
@@ -258,14 +246,12 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
     const updOrderR = await cx.query(updOrderQ, [order_id]);
 
     await cx.query("COMMIT");
-
     return res.json({
       ok: true,
       order: updOrderR.rows[0],
       client: clientR.rows[0],
       scantag,
-      message:
-        "Order processed: 1 ScanTag assigned, MyPunctoo enabled, marked ready to invoice.",
+      message: "Order processed: 1 ScanTag assigned, MyPunctoo enabled, marked ready to invoice.",
     });
   } catch (err) {
     await cx.query("ROLLBACK");
@@ -274,45 +260,15 @@ app.post("/api/admin/orders/:order_id/process", async (req, res) => {
     cx.release();
   }
 });
-// --- MyPunctoo access gate ---
-// Input: email (later vervangen door echte login/session)
-// Output: allowed + reason + client_id + scantag_id (indien beschikbaar)
+
+// -------------------- MyPunctoo access gate --------------------
 app.get("/api/mypunctoo/access", async (req, res) => {
-  const email = (req.query.email || "").toString().trim().toLowerCase();
-  if (!email) {
-    return res.status(400).json({ ok: false, error: "email query param is required" });
-  }
-
   try {
-    // CUSTOMER client by email
-    const cQ = `
-      SELECT client_id, client_type, company_name, email, mypunctoo_enabled, mypunctoo_enabled_at
-      FROM client
-      WHERE client_type = 'CUSTOMER' AND email = $1
-      LIMIT 1
-    `;
-    const cR = await pool.query(cQ, [email]);
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
 
-    if (cR.rowCount === 0) {
-      return res.status(404).json({
-        ok: true,
-        allowed: false,
-        reason: "NO_CUSTOMER_ACCOUNT",
-      });
-    }
+    const client = g.client;
 
-    const client = cR.rows[0];
-
-    if (!client.mypunctoo_enabled) {
-      return res.json({
-        ok: true,
-        allowed: false,
-        reason: "NOT_ENABLED_YET",
-        client_id: client.client_id,
-      });
-    }
-
-    // Must have an ACTIVE scantag
     const sQ = `
       SELECT scantag_id, qr_url_in, qr_url_out, status, created_at
       FROM scantag
@@ -321,14 +277,8 @@ app.get("/api/mypunctoo/access", async (req, res) => {
       LIMIT 1
     `;
     const sR = await pool.query(sQ, [client.client_id]);
-
     if (sR.rowCount === 0) {
-      return res.json({
-        ok: true,
-        allowed: false,
-        reason: "NO_ACTIVE_SCANTAG",
-        client_id: client.client_id,
-      });
+      return res.json({ ok: true, allowed: false, reason: "NO_ACTIVE_SCANTAG", client_id: client.client_id });
     }
 
     return res.json({
@@ -346,4 +296,175 @@ app.get("/api/mypunctoo/access", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// ===============================================================
+// Employees CRUD (MyPunctoo)
+// ===============================================================
+
+// LIST employees
+app.get("/api/mypunctoo/employees", async (req, res) => {
+  try {
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
+
+    const clientId = g.client.client_id;
+
+    const q = `
+      SELECT employee_id, client_id, first_name, last_name, email, created_at, updated_at
+      FROM employee
+      WHERE client_id = $1
+      ORDER BY created_at DESC
+    `;
+    const r = await pool.query(q, [clientId]);
+    return res.json({ ok: true, employees: r.rows });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// CREATE employee
+app.post("/api/mypunctoo/employees", async (req, res) => {
+  try {
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
+
+    const clientId = g.client.client_id;
+
+    const { first_name, last_name, email } = req.body || {};
+    if (!first_name || typeof first_name !== "string") {
+      return res.status(400).json({ ok: false, error: "first_name is required" });
+    }
+    if (!last_name || typeof last_name !== "string") {
+      return res.status(400).json({ ok: false, error: "last_name is required" });
+    }
+    if (!isEmail(email)) {
+      return res.status(400).json({ ok: false, error: "valid email is required" });
+    }
+
+    const q = `
+      INSERT INTO employee (client_id, first_name, last_name, email)
+      VALUES ($1, $2, $3, $4)
+      RETURNING employee_id, client_id, first_name, last_name, email, created_at, updated_at
+    `;
+    const r = await pool.query(q, [
+      clientId,
+      first_name.trim(),
+      last_name.trim(),
+      email.trim().toLowerCase(),
+    ]);
+
+    return res.status(201).json({ ok: true, employee: r.rows[0] });
+  } catch (err) {
+    // typische oorzaak: unieke constraint (bv. client_id+email)
+    if ((err.code || "").toString() === "23505") {
+      return res.status(409).json({ ok: false, error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" });
+    }
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// READ employee by id
+app.get("/api/mypunctoo/employees/:employee_id", async (req, res) => {
+  try {
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
+
+    const clientId = g.client.client_id;
+    const { employee_id } = req.params;
+
+    const q = `
+      SELECT employee_id, client_id, first_name, last_name, email, created_at, updated_at
+      FROM employee
+      WHERE employee_id = $1 AND client_id = $2
+      LIMIT 1
+    `;
+    const r = await pool.query(q, [employee_id, clientId]);
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
+
+    return res.json({ ok: true, employee: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// UPDATE employee
+app.put("/api/mypunctoo/employees/:employee_id", async (req, res) => {
+  try {
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
+
+    const clientId = g.client.client_id;
+    const { employee_id } = req.params;
+
+    const { first_name, last_name, email } = req.body || {};
+
+    // minstens 1 veld
+    if (!first_name && !last_name && !email) {
+      return res.status(400).json({ ok: false, error: "provide first_name and/or last_name and/or email" });
+    }
+    if (email && !isEmail(email)) {
+      return res.status(400).json({ ok: false, error: "valid email is required" });
+    }
+
+    const q = `
+      UPDATE employee
+      SET
+        first_name = COALESCE($3, first_name),
+        last_name  = COALESCE($4, last_name),
+        email      = COALESCE($5, email),
+        updated_at = NOW()
+      WHERE employee_id = $1 AND client_id = $2
+      RETURNING employee_id, client_id, first_name, last_name, email, created_at, updated_at
+    `;
+    const r = await pool.query(q, [
+      employee_id,
+      clientId,
+      first_name ? first_name.trim() : null,
+      last_name ? last_name.trim() : null,
+      email ? email.trim().toLowerCase() : null,
+    ]);
+
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
+    return res.json({ ok: true, employee: r.rows[0] });
+  } catch (err) {
+    if ((err.code || "").toString() === "23505") {
+      return res.status(409).json({ ok: false, error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" });
+    }
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// DELETE employee
+app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
+  try {
+    const g = await getEnabledCustomerByEmail(req.query.email);
+    if (!g.ok) return res.status(g.status).json(g.body);
+
+    const clientId = g.client.client_id;
+    const { employee_id } = req.params;
+
+    // hard delete (als scan_event FK restrict is, kan dit falen — dan tonen we een duidelijke fout)
+    const q = `
+      DELETE FROM employee
+      WHERE employee_id = $1 AND client_id = $2
+      RETURNING employee_id
+    `;
+    const r = await pool.query(q, [employee_id, clientId]);
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "employee not found" });
+
+    return res.json({ ok: true, deleted: true, employee_id: r.rows[0].employee_id });
+  } catch (err) {
+    // foreign key violation (bv. scan_event verwijst nog)
+    if ((err.code || "").toString() === "23503") {
+      return res.status(409).json({ ok: false, error: "EMPLOYEE_IN_USE_CANNOT_DELETE" });
+    }
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// -------------------- listen (ALTIJD op het einde) --------------------
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
 });
