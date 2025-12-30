@@ -1,5 +1,7 @@
 const express = require("express");
 const { pool } = require("./db");
+const crypto = require("crypto");
+
 
 const app = express();
 app.use(express.json());
@@ -167,5 +169,108 @@ app.get("/api/orders/:order_id", async (req, res) => {
     return res.json({ ok: true, order: r.rows[0] });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+// --- ADMIN: process an order (assign 1 ScanTag, enable MyPunctoo, mark ready to invoice) ---
+// TODO: protect this route with ADMIN_LOGIN / ADMIN_PASSWORD_HASH (shared admin login)
+app.post("/api/admin/orders/:order_id/process", async (req, res) => {
+  const { order_id } = req.params;
+
+  const cx = await pool.connect();
+  try {
+    await cx.query("BEGIN");
+
+    // Lock the order row to avoid double processing
+    const orderQ = `
+      SELECT o.order_id, o.status, o.client_id
+      FROM subscription_order o
+      WHERE o.order_id = $1
+      FOR UPDATE
+    `;
+    const orderR = await cx.query(orderQ, [order_id]);
+
+    if (orderR.rowCount === 0) {
+      await cx.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "order not found" });
+    }
+
+    const order = orderR.rows[0];
+
+    if (order.status !== "NEW") {
+      // already processed or not in correct state
+      await cx.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        error: `order not processable (status=${order.status})`,
+      });
+    }
+
+    const clientId = order.client_id;
+
+    // Create ScanTag for this client (includes IN + OUT QR urls + printable id)
+    // We'll generate simple unique urls for now; later we can align exact URL format.
+    // Important: ScanTag-ID = composed print asset (PDF) built from qr_url_in + qr_url_out.
+    // For now: store urls; PDF generation comes later.
+    const insertScanTagQ = `
+      INSERT INTO scantag (
+        client_id,
+        qr_url_in,
+        qr_url_out,
+        status
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        'ACTIVE'
+      )
+      RETURNING scantag_id, qr_url_in, qr_url_out, status, created_at;
+    `;
+
+    const qrIn = `https://scan.punctoo.be/in/${crypto.randomUUID()}`;
+    const qrOut = `https://scan.punctoo.be/out/${crypto.randomUUID()}`;
+
+    const stR = await cx.query(insertScanTagQ, [clientId, qrIn, qrOut]);
+    const scantag = stR.rows[0];
+
+    // Enable MyPunctoo for the client
+    const enableClientQ = `
+      UPDATE client
+      SET mypunctoo_enabled = TRUE,
+          mypunctoo_enabled_at = NOW(),
+          updated_at = NOW()
+      WHERE client_id = $1
+      RETURNING client_id, mypunctoo_enabled, mypunctoo_enabled_at;
+    `;
+    const clientR = await cx.query(enableClientQ, [clientId]);
+
+    // Mark order processed + ready to invoice
+    const updOrderQ = `
+      UPDATE subscription_order
+      SET status = 'PROCESSED',
+          processed_at = NOW(),
+          ready_to_invoice = TRUE,
+          ready_to_invoice_at = NOW(),
+          updated_at = NOW()
+      WHERE order_id = $1
+      RETURNING order_id, status, processed_at, ready_to_invoice, ready_to_invoice_at;
+    `;
+    const updOrderR = await cx.query(updOrderQ, [order_id]);
+
+    await cx.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      order: updOrderR.rows[0],
+      client: clientR.rows[0],
+      scantag,
+      message:
+        "Order processed: 1 ScanTag assigned, MyPunctoo enabled, marked ready to invoice.",
+    });
+  } catch (err) {
+    await cx.query("ROLLBACK");
+    return res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    cx.release();
   }
 });
