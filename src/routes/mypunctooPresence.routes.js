@@ -156,7 +156,8 @@ router.get("/presence", async (req, res) => {
           WHEN (le.direction = 'OUT' AND le.anomaly_code = 'OUT_WITHOUT_IN') THEN 0
           ELSE 1
         END,
-        e.created_at DESC;
+       e.last_name ASC,
+       e.first_name ASC;
     `;
 
     // Summary
