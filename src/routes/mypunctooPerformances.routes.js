@@ -13,7 +13,6 @@ function toLowerEmail(emailRaw) {
 function parseDateOnlyToIsoStart(dateStr) {
   // dateStr: "YYYY-MM-DD" -> "YYYY-MM-DDT00:00:00.000Z"
   // We keep it simple: treat as UTC date boundary for now.
-  // (Later: can align with Europe/Brussels if/when you want.)
   if (!dateStr) return null;
   const s = String(dateStr).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
@@ -27,6 +26,18 @@ function minutesDiff(startIso, endIso) {
   const ms = b - a;
   if (ms < 0) return null;
   return Math.round(ms / 60000);
+}
+
+function calcDifferenceAndOvertime(effectiveMinutes, referenceMinutes) {
+  if (!Number.isFinite(effectiveMinutes)) {
+    return { difference_minutes: null, overtime_minutes: null };
+  }
+  if (!Number.isFinite(referenceMinutes)) {
+    return { difference_minutes: null, overtime_minutes: null };
+  }
+  const diff = effectiveMinutes - referenceMinutes;
+  const overtime = diff > 0 ? diff : 0;
+  return { difference_minutes: diff, overtime_minutes: overtime };
 }
 
 /**
@@ -114,8 +125,8 @@ function buildPerformancesFromEvents(events) {
       effective_minutes: null,
 
       registration_complete: false, // full IN+OUT present
-      measurable: false,            // IN & OUT are measurement_valid=true
-      attention: true,              // default for incomplete/invalid
+      measurable: false, // IN & OUT are measurement_valid=true
+      attention: true, // default for incomplete/invalid
       attention_reasons: [],
 
       start_event_id: null,
@@ -129,17 +140,13 @@ function buildPerformancesFromEvents(events) {
 
   for (const ev of events) {
     const direction = ev.direction;
-    const measurementValid = ev.measurement_valid === true; // normalize
+    const measurementValid = ev.measurement_valid === true;
     const anomalyCode = ev.anomaly_code || null;
 
     if (direction === "IN") {
       if (!open) {
-        open = {
-          ev,
-          extra_in_while_open: 0,
-        };
+        open = { ev, extra_in_while_open: 0 };
       } else {
-        // IN while already open -> attention signal
         open.extra_in_while_open += 1;
       }
       continue;
@@ -163,12 +170,9 @@ function buildPerformancesFromEvents(events) {
 
         p.registration_complete = true;
 
-        // "measurable" only if both are measurement_valid=true
         p.measurable = (start.measurement_valid === true) && (end.measurement_valid === true);
 
-        // effective_minutes: we can compute it always, but only "trusted" if measurable
-        const mins = minutesDiff(start.scanned_at, end.scanned_at);
-        p.effective_minutes = mins;
+        p.effective_minutes = minutesDiff(start.scanned_at, end.scanned_at);
 
         // attention rules: any invalid, any anomaly_code, or extra IN while open
         p.attention = false;
@@ -240,8 +244,12 @@ function buildPerformancesFromEvents(events) {
  * GET /api/mypunctoo/performances?email=...&from=YYYY-MM-DD&to=YYYY-MM-DD
  *
  * Notes:
- * - This endpoint is read-only and purely factual (no referentieduur / no over-time yet).
+ * - This endpoint is read-only and factual.
  * - It returns "aanwezigheidsprestaties" per employee.
+ * - It also adds:
+ *   - referentieduur_minutes (per employee: override or client default)
+ *   - difference_minutes (effective - referentieduur) for measurable performances
+ *   - overtime_minutes (max(0, difference))
  */
 router.get("/performances", async (req, res) => {
   try {
@@ -254,28 +262,61 @@ router.get("/performances", async (req, res) => {
     const fromIso = parseDateOnlyToIsoStart(req.query.from);
     const toIso = parseDateOnlyToIsoStart(req.query.to);
 
+    // Client default referentieduur (minutes)
+    // NOTE: you must add client.referentieduur_default_minutes in DB (see SQL you ran/need to run)
+    const cdQ = `
+      SELECT COALESCE(referentieduur_default_minutes, 510)::int AS referentieduur_default_minutes
+      FROM client
+      WHERE client_id = $1
+      LIMIT 1
+    `;
+    let clientDefaultRef = 510;
+    try {
+      const cdR = await pool.query(cdQ, [clientId]);
+      if (cdR.rowCount) clientDefaultRef = cdR.rows[0].referentieduur_default_minutes;
+    } catch (e) {
+      // If column doesn't exist yet, keep fallback 510.
+      clientDefaultRef = 510;
+    }
+
     // Employees for this client
+    // NOTE: you must add employee.referentieduur_minutes in DB (see SQL you ran/need to run)
     const eQ = `
-      SELECT employee_id, first_name, last_name, email, created_at
+      SELECT employee_id, first_name, last_name, email, created_at,
+             referentieduur_minutes
       FROM employee
       WHERE client_id = $1
       ORDER BY last_name ASC, first_name ASC
     `;
-    const eR = await pool.query(eQ, [clientId]);
-    const employees = eR.rows || [];
+    let employees = [];
+    try {
+      const eR = await pool.query(eQ, [clientId]);
+      employees = eR.rows || [];
+    } catch (e) {
+      // If column doesn't exist yet, fallback to old select
+      const eQfallback = `
+        SELECT employee_id, first_name, last_name, email, created_at
+        FROM employee
+        WHERE client_id = $1
+        ORDER BY last_name ASC, first_name ASC
+      `;
+      const eR = await pool.query(eQfallback, [clientId]);
+      employees = (eR.rows || []).map((r) => ({ ...r, referentieduur_minutes: null }));
+    }
 
     if (employees.length === 0) {
       return res.json({
         ok: true,
         timestamp: new Date().toISOString(),
+        from: fromIso || null,
+        to: toIso || null,
         employees: [],
       });
     }
 
     const employeeIds = employees.map((e) => e.employee_id);
 
-    // Fetch scan events for all employees in one go (optionally filtered by date range)
-    // We keep ordering stable for pairing.
+    // Fetch scan events for all employees (optionally filtered by date range)
     let seQ = `
       SELECT
         se.scan_event_id,
@@ -314,10 +355,37 @@ router.get("/performances", async (req, res) => {
       eventsByEmployee.get(ev.employee_id).push(ev);
     }
 
-    // Build performances per employee
+    // Build performances per employee + compute reference/delta/overtime
     const outEmployees = employees.map((e) => {
       const evs = eventsByEmployee.get(e.employee_id) || [];
       const performances = buildPerformancesFromEvents(evs);
+
+      const empRefRaw = e.referentieduur_minutes;
+      const empRef =
+        empRefRaw === null || empRefRaw === undefined
+          ? null
+          : Number.isFinite(Number(empRefRaw))
+            ? parseInt(empRefRaw, 10)
+            : null;
+
+      const appliedRef = Number.isFinite(empRef) ? empRef : clientDefaultRef;
+      const source = Number.isFinite(empRef) ? "EMPLOYEE" : "CLIENT_DEFAULT";
+
+      const performancesWithRef = performances.map((p) => {
+        const reference_minutes = appliedRef;
+
+        const canCalc = p.measurable === true && Number.isFinite(p.effective_minutes);
+        const { difference_minutes, overtime_minutes } = canCalc
+          ? calcDifferenceAndOvertime(p.effective_minutes, reference_minutes)
+          : { difference_minutes: null, overtime_minutes: null };
+
+        return {
+          ...p,
+          reference_minutes,
+          difference_minutes,
+          overtime_minutes,
+        };
+      });
 
       return {
         employee_id: e.employee_id,
@@ -325,7 +393,13 @@ router.get("/performances", async (req, res) => {
         last_name: e.last_name,
         email: e.email,
         display_name: `${(e.first_name || "").trim()} ${(e.last_name || "").trim()}`.trim(),
-        performances,
+
+        // reference info per employee
+        referentieduur_minutes: appliedRef,
+        referentieduur_source: source,
+        client_default_referentieduur_minutes: clientDefaultRef,
+
+        performances: performancesWithRef,
       };
     });
 
