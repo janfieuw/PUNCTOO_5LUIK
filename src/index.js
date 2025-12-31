@@ -3,6 +3,8 @@ const { pool } = require("./db");
 const crypto = require("crypto");
 const mypunctooPresenceRoutes = require("./routes/mypunctooPresence.routes");
 const mypunctooPerformancesRoutes = require("./routes/mypunctooPerformances.routes");
+const mypunctooReportsRoutes = require("./routes/mypunctooReports.routes");
+
 
 
 
@@ -527,6 +529,8 @@ app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
 app.use("/api/mypunctoo", mypunctooScanEventsRoutes);
 app.use("/api/mypunctoo", mypunctooPresenceRoutes);
 app.use("/api/mypunctoo", mypunctooPerformancesRoutes);
+app.use("/api/mypunctoo", mypunctooReportsRoutes);
+
 
 
 

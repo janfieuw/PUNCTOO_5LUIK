@@ -1,14 +1,11 @@
-import express from "express";
-import { exportEffectiveAttendanceXlsx } from "../controllers/mypunctooReports.controller.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+const express = require("express");
+const {
+  exportEffectiveAttendanceXlsx,
+} = require("../controllers/mypunctooReports.controller");
 
 const router = express.Router();
 
 // Rapport 1 — Effectieve aanwezigheid (XLS)
-router.get(
-  "/reports/effective-attendance.xlsx",
-  requireAuth,
-  exportEffectiveAttendanceXlsx
-);
+router.get("/reports/effective-attendance.xlsx", exportEffectiveAttendanceXlsx);
 
-export default router;
+module.exports = router;
