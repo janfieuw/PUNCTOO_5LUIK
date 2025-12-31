@@ -1,6 +1,8 @@
 const express = require("express");
 const { pool } = require("./db");
 const crypto = require("crypto");
+const mypunctooPresenceRoutes = require("./routes/mypunctooPresence.routes");
+
 
 // ✅ NEW: scan-events router (refactor optie 1)
 const mypunctooScanEventsRoutes = require("./routes/mypunctooScanEvents.routes");
@@ -521,6 +523,8 @@ app.delete("/api/mypunctoo/employees/:employee_id", async (req, res) => {
 
 // ✅ NEW: mount scan-events router (this router defines /employees/:id/scan-events)
 app.use("/api/mypunctoo", mypunctooScanEventsRoutes);
+app.use("/api/mypunctoo", mypunctooPresenceRoutes);
+
 
 // -------------------- listen (ALTIJD op het einde) --------------------
 const port = process.env.PORT || 3000;
