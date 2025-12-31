@@ -124,19 +124,32 @@ async function exportOvertimeXlsx(req, res) {
   ws.getRow(1).alignment = { vertical: "middle", wrapText: true };
   ws.getRow(1).height = 30;
 
-  // Rij 2: VOLLEDIGE headers (fix)
-  ws.columns = [
-    { header: "employee_id", key: "employee_id", width: 18 },
-    { header: "employee_name", key: "employee_name", width: 28 },
-    { header: "date_in", key: "date_in", width: 12 },
-    { header: "time_in", key: "time_in", width: 12 },
-    { header: "date_out", key: "date_out", width: 12 },
-    { header: "time_out", key: "time_out", width: 12 },
-    { header: "effective_minutes", key: "effective_minutes", width: 16 },
-    { header: "reference_minutes", key: "reference_minutes", width: 18 },
-    { header: "overtime_minutes", key: "overtime_minutes", width: 16 },
-  ];
-  ws.getRow(2).font = { bold: true };
+ws.columns = [
+  { key: "employee_id", width: 18 },
+  { key: "employee_name", width: 28 },
+  { key: "date_in", width: 12 },
+  { key: "time_in", width: 12 },
+  { key: "date_out", width: 12 },
+  { key: "time_out", width: 12 },
+  { key: "effective_minutes", width: 16 },
+  { key: "reference_minutes", width: 18 },
+  { key: "overtime_minutes", width: 16 },
+];
+
+// EXPliciete header-rij op rij 2
+ws.getRow(2).values = [
+  "employee_id",
+  "employee_name",
+  "date_in",
+  "time_in",
+  "date_out",
+  "time_out",
+  "effective_minutes",
+  "reference_minutes",
+  "overtime_minutes",
+];
+ws.getRow(2).font = { bold: true };
+
 
   // Data vanaf rij 3
   for (const emp of data.employees || []) {
