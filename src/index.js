@@ -4,6 +4,8 @@ const crypto = require("crypto");
 const mypunctooPresenceRoutes = require("./routes/mypunctooPresence.routes");
 const mypunctooPerformancesRoutes = require("./routes/mypunctooPerformances.routes");
 const mypunctooReportsRoutes = require("./routes/mypunctooReports.routes");
+const mypunctooReferenceRoutes = require("./routes/mypunctooReference.routes");
+
 
 
 
@@ -530,6 +532,8 @@ app.use("/api/mypunctoo", mypunctooScanEventsRoutes);
 app.use("/api/mypunctoo", mypunctooPresenceRoutes);
 app.use("/api/mypunctoo", mypunctooPerformancesRoutes);
 app.use("/api/mypunctoo", mypunctooReportsRoutes);
+app.use("/api/mypunctoo", mypunctooReferenceRoutes);
+
 
 
 
