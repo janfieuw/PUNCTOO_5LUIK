@@ -116,7 +116,7 @@ async function exportOvertimeXlsx(req, res) {
     views: [{ state: "frozen", ySplit: 2 }],
   });
 
-  // Row 1: definitie (geen oordeel, wel uitleg)
+  // Rij 1: definitie (informatief)
   ws.getCell("A1").value =
     "Over-time is het positieve tijdverschil tussen de referentieduur van een aanwezigheidsprestatie (inclusief pauzes) en de effectieve aanwezigheid.";
   ws.mergeCells("A1", "I1");
@@ -124,7 +124,7 @@ async function exportOvertimeXlsx(req, res) {
   ws.getRow(1).alignment = { vertical: "middle", wrapText: true };
   ws.getRow(1).height = 30;
 
-  // Header row (row 2)
+  // Rij 2: VOLLEDIGE headers (fix)
   ws.columns = [
     { header: "employee_id", key: "employee_id", width: 18 },
     { header: "employee_name", key: "employee_name", width: 28 },
@@ -133,25 +133,25 @@ async function exportOvertimeXlsx(req, res) {
     { header: "date_out", key: "date_out", width: 12 },
     { header: "time_out", key: "time_out", width: 12 },
     { header: "effective_minutes", key: "effective_minutes", width: 16 },
-    { header: "reference_minutes", key: "reference_minutes", width: 16 },
+    { header: "reference_minutes", key: "reference_minutes", width: 18 },
     { header: "overtime_minutes", key: "overtime_minutes", width: 16 },
   ];
-
   ws.getRow(2).font = { bold: true };
 
-  // Data rows start at row 3
+  // Data vanaf rij 3
   for (const emp of data.employees || []) {
     // Alleen werknemers met referentieduur
     if (!Number.isFinite(emp.referentieduur_minutes)) continue;
 
-    const name = emp.display_name || `${emp.first_name || ""} ${emp.last_name || ""}`.trim();
+    const name =
+      emp.display_name ||
+      `${(emp.first_name || "").trim()} ${(emp.last_name || "").trim()}`.trim();
 
     for (const p of emp.performances || []) {
       // Alleen meetbaar + compleet + overtime > 0
       if (p.measurable !== true) continue;
       if (!p.started_at || !p.ended_at) continue;
-      if (!Number.isFinite(p.overtime_minutes)) continue;
-      if (p.overtime_minutes <= 0) continue;
+      if (!Number.isFinite(p.overtime_minutes) || p.overtime_minutes <= 0) continue;
 
       const started = new Date(p.started_at);
       const ended = new Date(p.ended_at);
