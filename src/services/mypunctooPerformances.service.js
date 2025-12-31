@@ -8,6 +8,8 @@ function toLowerEmail(emailRaw) {
 }
 
 function parseDateOnlyToIsoStart(dateStr) {
+  // "YYYY-MM-DD" -> "YYYY-MM-DDT00:00:00.000Z"
+  // Simple UTC boundary for now.
   if (!dateStr) return null;
   const s = String(dateStr).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
@@ -23,6 +25,11 @@ function minutesDiff(startIso, endIso) {
   return Math.round(ms / 60000);
 }
 
+/**
+ * OPTIE 2:
+ * difference_minutes = reference - effective
+ * overtime_minutes = max(0, effective - reference) = max(0, -difference)
+ */
 function calcDifferenceAndOvertime(effectiveMinutes, referenceMinutes) {
   if (!Number.isFinite(effectiveMinutes)) {
     return { difference_minutes: null, overtime_minutes: null };
@@ -30,13 +37,15 @@ function calcDifferenceAndOvertime(effectiveMinutes, referenceMinutes) {
   if (!Number.isFinite(referenceMinutes)) {
     return { difference_minutes: null, overtime_minutes: null };
   }
-  const diff = effectiveMinutes - referenceMinutes;
-  const overtime = diff > 0 ? diff : 0;
+
+  const diff = referenceMinutes - effectiveMinutes; // OPTIE 2
+  const overtime = diff < 0 ? Math.abs(diff) : 0;   // overtime = max(0, effective-reference)
+
   return { difference_minutes: diff, overtime_minutes: overtime };
 }
 
 /**
- * Context helpers (zelfde gating als je routes)
+ * Context helpers (same gating pattern as other mypunctoo routes)
  */
 async function getEnabledCustomerByEmail(emailRaw) {
   const email = toLowerEmail(emailRaw);
@@ -105,7 +114,9 @@ async function getMypunctooContext(emailRaw) {
 
 /**
  * Build "aanwezigheidsprestaties" per employee from scan events.
- * 1:1 gebaseerd op jouw route (geen interpretatie, wel flags).
+ * - A performance ideally starts at an IN and ends at the next OUT.
+ * - If OUT occurs without an open IN -> standalone attention record.
+ * - If IN occurs while already open -> attention (we keep the open one).
  */
 function buildPerformancesFromEvents(events) {
   const performances = [];
@@ -117,9 +128,9 @@ function buildPerformancesFromEvents(events) {
       ended_at: null,
       effective_minutes: null,
 
-      registration_complete: false,
-      measurable: false,
-      attention: true,
+      registration_complete: false, // full IN+OUT present
+      measurable: false, // IN & OUT are measurement_valid=true
+      attention: true, // default for incomplete/invalid
       attention_reasons: [],
 
       start_event_id: null,
@@ -162,9 +173,12 @@ function buildPerformancesFromEvents(events) {
         p.end_anomaly_code = end.anomaly_code || null;
 
         p.registration_complete = true;
+
         p.measurable = (start.measurement_valid === true) && (end.measurement_valid === true);
+
         p.effective_minutes = minutesDiff(start.scanned_at, end.scanned_at);
 
+        // attention rules: any invalid, any anomaly_code, or extra IN while open
         p.attention = false;
         if (!p.measurable) {
           p.attention = true;
@@ -186,6 +200,7 @@ function buildPerformancesFromEvents(events) {
         performances.push(p);
         open = null;
       } else {
+        // OUT without any open IN -> attention record
         const p = makeBasePerformance();
         p.ended_at = ev.scanned_at;
         p.end_event_id = ev.scan_event_id;
@@ -202,8 +217,11 @@ function buildPerformancesFromEvents(events) {
       }
       continue;
     }
+
+    // unknown direction -> ignore
   }
 
+  // If still open -> open performance (IN without OUT)
   if (open) {
     const start = open.ev;
     const p = makeBasePerformance();
@@ -228,8 +246,8 @@ function buildPerformancesFromEvents(events) {
 
 /**
  * PUBLIC: performances data voor API én exports
- * - GEEN client-defaults
- * - referentieduur = employee.referentieduur_minutes (kan NULL)
+ * - GEEN defaults
+ * - reference_minutes = employee.referentieduur_minutes (kan NULL)
  * - difference/overtime enkel als measurable én referentie bestaat
  */
 async function getPerformancesData({ email, from, to, employee_id = null }) {
@@ -241,9 +259,11 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
   const fromIso = parseDateOnlyToIsoStart(from);
   const toIso = parseDateOnlyToIsoStart(to);
 
-  // employees
+  // Employees for this client
+  // NOTE: employee.referentieduur_minutes must exist; we do a fallback if not.
   const eQ = `
-    SELECT employee_id, first_name, last_name, email, created_at, referentieduur_minutes
+    SELECT employee_id, first_name, last_name, email, created_at,
+           referentieduur_minutes
     FROM employee
     WHERE client_id = $1
     ORDER BY last_name ASC, first_name ASC
@@ -253,7 +273,7 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
     const eR = await pool.query(eQ, [clientId]);
     employees = eR.rows || [];
   } catch (e) {
-    // fallback als referentieduur_minutes kolom nog niet bestaat
+    // If column doesn't exist yet, fallback to old select
     const eQfallback = `
       SELECT employee_id, first_name, last_name, email, created_at
       FROM employee
@@ -281,7 +301,7 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
 
   const employeeIds = employees.map((e) => e.employee_id);
 
-  // scan events
+  // Fetch scan events for all employees (optionally filtered by date range)
   let seQ = `
     SELECT
       se.scan_event_id,
@@ -313,16 +333,19 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
   const seR = await pool.query(seQ, params);
   const allEvents = seR.rows || [];
 
+  // Group events per employee
   const eventsByEmployee = new Map();
   for (const ev of allEvents) {
     if (!eventsByEmployee.has(ev.employee_id)) eventsByEmployee.set(ev.employee_id, []);
     eventsByEmployee.get(ev.employee_id).push(ev);
   }
 
+  // Build performances per employee + compute reference/difference/overtime
   const outEmployees = employees.map((e) => {
     const evs = eventsByEmployee.get(e.employee_id) || [];
     const performances = buildPerformancesFromEvents(evs);
 
+    // employee ref only (no defaults)
     const empRefRaw = e.referentieduur_minutes;
     const empRef =
       empRefRaw === null || empRefRaw === undefined
@@ -331,7 +354,6 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
           ? parseInt(empRefRaw, 10)
           : null;
 
-    // PUNCTOO: geen defaults -> enkel employee ref of null
     const referenceForEmployee = Number.isFinite(empRef) ? empRef : null;
 
     const performancesWithRef = performances.map((p) => {
@@ -361,7 +383,7 @@ async function getPerformancesData({ email, from, to, employee_id = null }) {
       email: e.email,
       display_name: `${(e.first_name || "").trim()} ${(e.last_name || "").trim()}`.trim(),
 
-      // reference info per employee (geen defaults)
+      // reference info per employee (no defaults)
       referentieduur_minutes: referenceForEmployee,
 
       performances: performancesWithRef,

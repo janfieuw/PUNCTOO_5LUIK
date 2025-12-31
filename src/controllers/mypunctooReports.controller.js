@@ -1,20 +1,32 @@
 const ExcelJS = require("exceljs");
-const { getPerformances } = require("../services/mypunctooPerformances.service");
+const { getPerformancesData } = require("../services/mypunctooPerformances.service");
 
+function formatDate(d) {
+  const x = new Date(d);
+  return x.toISOString().slice(0, 10);
+}
 
+function formatTime(d) {
+  const x = new Date(d);
+  return x.toISOString().slice(11, 19);
+}
+
+/**
+ * Rapport 1 — Effectieve aanwezigheid (XLS)
+ * URL: /api/mypunctoo/reports/effective-attendance.xlsx?email=...&from=YYYY-MM-DD&to=YYYY-MM-DD
+ */
 async function exportEffectiveAttendanceXlsx(req, res) {
-  const { from, to, employee_id } = req.query;
+  const { email, from, to, employee_id } = req.query;
 
-  if (!from || !to) {
-    return res.status(400).json({ error: "from and to are required (YYYY-MM-DD)" });
+  if (!email) return res.status(400).json({ ok: false, error: "email query param is required" });
+  if (!from || !to) return res.status(400).json({ ok: false, error: "from and to are required (YYYY-MM-DD)" });
+
+  // Haal dezelfde performances-data als de JSON endpoint
+  const data = await getPerformancesData({ email, from, to, employee_id: employee_id || null });
+
+  if (!data.ok && data.status) {
+    return res.status(data.status).json(data.body);
   }
-
-  const performances = await getPerformances({
-    clientId: req.user.client_id,
-    from,
-    to,
-    employeeId: employee_id || null,
-  });
 
   const wb = new ExcelJS.Workbook();
   wb.creator = "PUNCTOO";
@@ -38,46 +50,42 @@ async function exportEffectiveAttendanceXlsx(req, res) {
 
   ws.getRow(1).font = { bold: true };
 
-  for (const p of performances) {
-    ws.addRow({
-      employee_id: p.employee_id,
-      employee_name: p.employee_name || "",
-      date_in: p.scan_in_at ? formatDate(p.scan_in_at) : "",
-      time_in: p.scan_in_at ? formatTime(p.scan_in_at) : "",
-      date_out: p.scan_out_at ? formatDate(p.scan_out_at) : "",
-      time_out: p.scan_out_at ? formatTime(p.scan_out_at) : "",
-      duration_minutes:
-        p.scan_in_at && p.scan_out_at ? p.effective_minutes : "",
-      is_open_shift: !!p.is_open_shift,
-      attention_flags: Array.isArray(p.attention_flags)
-        ? p.attention_flags.join(",")
-        : p.attention_flags || "",
-    });
+  // Flatten: 1 rij per performance
+  for (const emp of data.employees || []) {
+    const name = emp.display_name || `${emp.first_name || ""} ${emp.last_name || ""}`.trim();
+
+    for (const p of emp.performances || []) {
+      const started = p.started_at ? new Date(p.started_at) : null;
+      const ended = p.ended_at ? new Date(p.ended_at) : null;
+
+      const isOpen = !!p.started_at && !p.ended_at;
+
+      // attention_flags: feitelijk, geen oordeel
+      const flags = Array.isArray(p.attention_reasons) ? p.attention_reasons.join(",") : "";
+
+      ws.addRow({
+        employee_id: emp.employee_id,
+        employee_name: name,
+
+        date_in: started ? formatDate(started) : "",
+        time_in: started ? formatTime(started) : "",
+
+        date_out: ended ? formatDate(ended) : "",
+        time_out: ended ? formatTime(ended) : "",
+
+        duration_minutes: Number.isFinite(p.effective_minutes) ? p.effective_minutes : "",
+        is_open_shift: isOpen ? "TRUE" : "FALSE",
+        attention_flags: flags,
+      });
+    }
   }
 
   const fileName = `punctoo_effective_attendance_${from}_${to}.xlsx`;
-
-  res.setHeader(
-    "Content-Type",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  );
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${fileName}"`
-  );
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
 
   await wb.xlsx.write(res);
   res.end();
-}
-
-function formatDate(d) {
-  const x = new Date(d);
-  return x.toISOString().slice(0, 10);
-}
-
-function formatTime(d) {
-  const x = new Date(d);
-  return x.toISOString().slice(11, 19);
 }
 
 module.exports = {
