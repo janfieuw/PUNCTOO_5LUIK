@@ -21,7 +21,6 @@ async function exportEffectiveAttendanceXlsx(req, res) {
   if (!email) return res.status(400).json({ ok: false, error: "email query param is required" });
   if (!from || !to) return res.status(400).json({ ok: false, error: "from and to are required (YYYY-MM-DD)" });
 
-  // Haal dezelfde performances-data als de JSON endpoint
   const data = await getPerformancesData({ email, from, to, employee_id: employee_id || null });
 
   if (!data.ok && data.status) {
@@ -50,7 +49,6 @@ async function exportEffectiveAttendanceXlsx(req, res) {
 
   ws.getRow(1).font = { bold: true };
 
-  // Flatten: 1 rij per performance
   for (const emp of data.employees || []) {
     const name = emp.display_name || `${emp.first_name || ""} ${emp.last_name || ""}`.trim();
 
@@ -59,8 +57,6 @@ async function exportEffectiveAttendanceXlsx(req, res) {
       const ended = p.ended_at ? new Date(p.ended_at) : null;
 
       const isOpen = !!p.started_at && !p.ended_at;
-
-      // attention_flags: feitelijk, geen oordeel
       const flags = Array.isArray(p.attention_reasons) ? p.attention_reasons.join(",") : "";
 
       ws.addRow({
@@ -88,6 +84,101 @@ async function exportEffectiveAttendanceXlsx(req, res) {
   res.end();
 }
 
+/**
+ * Rapport 2 — Over-time (XLS)
+ * Definitie: Over-time is het positieve tijdverschil tussen de referentieduur
+ * (inclusief pauzes) en de effectieve aanwezigheid.
+ *
+ * URL: /api/mypunctoo/reports/overtime.xlsx?email=...&from=YYYY-MM-DD&to=YYYY-MM-DD
+ *
+ * Regels:
+ * - Alleen werknemers met referentieduur_minutes != null
+ * - Alleen measurable prestaties met IN+OUT
+ * - Alleen overtime_minutes > 0 (geen under-time)
+ */
+async function exportOvertimeXlsx(req, res) {
+  const { email, from, to, employee_id } = req.query;
+
+  if (!email) return res.status(400).json({ ok: false, error: "email query param is required" });
+  if (!from || !to) return res.status(400).json({ ok: false, error: "from and to are required (YYYY-MM-DD)" });
+
+  const data = await getPerformancesData({ email, from, to, employee_id: employee_id || null });
+
+  if (!data.ok && data.status) {
+    return res.status(data.status).json(data.body);
+  }
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "PUNCTOO";
+  wb.created = new Date();
+
+  const ws = wb.addWorksheet("Over-time", {
+    views: [{ state: "frozen", ySplit: 2 }],
+  });
+
+  // Row 1: definitie (geen oordeel, wel uitleg)
+  ws.getCell("A1").value =
+    "Over-time is het positieve tijdverschil tussen de referentieduur van een aanwezigheidsprestatie (inclusief pauzes) en de effectieve aanwezigheid.";
+  ws.mergeCells("A1", "I1");
+  ws.getRow(1).font = { italic: true };
+  ws.getRow(1).alignment = { vertical: "middle", wrapText: true };
+  ws.getRow(1).height = 30;
+
+  // Header row (row 2)
+  ws.columns = [
+    { header: "employee_id", key: "employee_id", width: 18 },
+    { header: "employee_name", key: "employee_name", width: 28 },
+    { header: "date_in", key: "date_in", width: 12 },
+    { header: "time_in", key: "time_in", width: 12 },
+    { header: "date_out", key: "date_out", width: 12 },
+    { header: "time_out", key: "time_out", width: 12 },
+    { header: "effective_minutes", key: "effective_minutes", width: 16 },
+    { header: "reference_minutes", key: "reference_minutes", width: 16 },
+    { header: "overtime_minutes", key: "overtime_minutes", width: 16 },
+  ];
+
+  ws.getRow(2).font = { bold: true };
+
+  // Data rows start at row 3
+  for (const emp of data.employees || []) {
+    // Alleen werknemers met referentieduur
+    if (!Number.isFinite(emp.referentieduur_minutes)) continue;
+
+    const name = emp.display_name || `${emp.first_name || ""} ${emp.last_name || ""}`.trim();
+
+    for (const p of emp.performances || []) {
+      // Alleen meetbaar + compleet + overtime > 0
+      if (p.measurable !== true) continue;
+      if (!p.started_at || !p.ended_at) continue;
+      if (!Number.isFinite(p.overtime_minutes)) continue;
+      if (p.overtime_minutes <= 0) continue;
+
+      const started = new Date(p.started_at);
+      const ended = new Date(p.ended_at);
+
+      ws.addRow({
+        employee_id: emp.employee_id,
+        employee_name: name,
+        date_in: formatDate(started),
+        time_in: formatTime(started),
+        date_out: formatDate(ended),
+        time_out: formatTime(ended),
+        effective_minutes: p.effective_minutes,
+        reference_minutes: p.reference_minutes,
+        overtime_minutes: p.overtime_minutes,
+      });
+    }
+  }
+
+  const fileName = `punctoo_overtime_${from}_${to}.xlsx`;
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+  await wb.xlsx.write(res);
+  res.end();
+}
+
 module.exports = {
   exportEffectiveAttendanceXlsx,
+  exportOvertimeXlsx,
 };
